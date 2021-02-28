@@ -1,0 +1,306 @@
+diff --git a/HAL9000/headers/process.h b/HAL9000/headers/process.h
+index 4d01ca8..a9d3f57 100644
+--- a/HAL9000/headers/process.h
++++ b/HAL9000/headers/process.h
+@@ -13,6 +13,7 @@ typedef struct _PROCESS* PPROCESS;
+ // Parameter:    IN_Z char * PathToExe
+ // Parameter:    IN_OPT_Z char * Arguments
+ // Parameter:    OUT_PTR PPROCESS * Process
++// Parameter:    OUT_PTR PVOID * WantedAddress, the address where to load the exe in memory
+ // NOTE:         All the processes's threads may terminate, but the process data
+ //               structure will not be un-allocated until the handle receive in
+ //               Process is closed with ProcessCloseHandle.
+@@ -21,7 +22,8 @@ STATUS
+ ProcessCreate(
+     IN_Z        char*       PathToExe,
+     IN_OPT_Z    char*       Arguments,
+-    OUT_PTR     PPROCESS*   Process
++    OUT_PTR     PPROCESS*   Process,
++    IN_OPT      PVOID       WantedAddress
+     );
+ 
+ //******************************************************************************
+diff --git a/HAL9000/src/cmd_proc_helper.c b/HAL9000/src/cmd_proc_helper.c
+index c6e824a..fb3956c 100644
+--- a/HAL9000/src/cmd_proc_helper.c
++++ b/HAL9000/src/cmd_proc_helper.c
+@@ -95,7 +95,8 @@ void
+ 
+     status = ProcessCreate(ProcessPath,
+                            NULL,
+-                           &pProcess);
++                           &pProcess,
++                           NULL);
+     if (!SUCCEEDED(status))
+     {
+         perror("ProcessCreate failed with status 0x%x\n", status);
+diff --git a/HAL9000/src/mmu.c b/HAL9000/src/mmu.c
+index 9e7938a..a2baeb6 100644
+--- a/HAL9000/src/mmu.c
++++ b/HAL9000/src/mmu.c
+@@ -15,6 +15,7 @@
+ #include "thread_internal.h"
+ #include "io.h"
+ #include "mdl.h"
++#include "../../PE_Parser/headers/pe_structures.h"
+ 
+ #define PAGING_STRUCTURES_BASE_MEMORY                           (128*KB_SIZE)
+ 
+@@ -887,9 +888,12 @@ MmuLoadPe(
+     status = STATUS_SUCCESS;
+ 
+     RecRwSpinlockAcquireExclusive(&PagingData->Lock, &oldState);
++
++    //! map the exe to the default address
+     status = _MmuMapPeInMemory(&PagingData->Data,
+                                NtHeader,
+-                               NtHeader->Preferred.ImageBase);
++                               NtHeader->WantedAddress);
++
+     RecRwSpinlockReleaseExclusive(&PagingData->Lock, oldState);
+ 
+     return status;
+@@ -926,9 +930,10 @@ MmuCreateAddressSpaceForProcess(
+ 
+         // Create the VMM management structures (VMM_RESERVATION_SPACE) to describe the processes
+         // virtual memory allocations
++        PVOID mapAddress = Process->HeaderInfo->WantedAddress ? Process->HeaderInfo->WantedAddress : Process->HeaderInfo->Preferred.ImageBase;
+         status = VmmCreateVirtualAddressSpace(&Process->VaSpace,
+                                               VA_METADATA_SIZE_FOR_UM_PROCESS,
+-                                              PtrOffset(Process->HeaderInfo->Preferred.ImageBase, VA_ALLOCATIONS_START_OFFSET_FROM_IMAGE_BASE));
++                                              PtrOffset(mapAddress, VA_ALLOCATIONS_START_OFFSET_FROM_IMAGE_BASE));
+         if(!SUCCEEDED(status))
+         {
+             LOG_FUNC_ERROR("VmmCreateVirtualAddressSpace", status);
+@@ -1557,12 +1562,85 @@ _MmuRemapStack(
+     return status;
+ }
+ 
++//! This function will apply the relocation for the given sector
++//! Usefull staff (https://stackoverflow.com/questions/17436668/how-are-pe-base-relocations-build-up)
++//! The relocation mechanism was designed by Sandu Cristian (Winter / 2021), github: https://github.com/TheMarshalMole
++static
++void
++_MmuApplyRelocations(
++    INOUT       PVOID                   BaseAddress,                 //! base address for the MZ-PE
++    IN          PVOID                   AddressToMap,                //! where is the EXE mapped
++    IN          PPE_NT_HEADER_INFO      HeaderInfo                   //! the header info structure, it contains all the goodies
++)
++{
++    PIMAGE_NT_HEADERS64 pNTHeader = HeaderInfo->NtBase;
++    PIMAGE_DATA_DIRECTORY RelocationImage = &pNTHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
++
++    //! it will be added to all of the relocation things
++    QWORD RellocationOffset = (QWORD)AddressToMap - (QWORD)HeaderInfo->Preferred.ImageBase;
++
++    PIMAGE_BASE_RELOCATION relocationBase = (PIMAGE_BASE_RELOCATION)((QWORD)BaseAddress + RelocationImage->VirtualAddress);
++    if (relocationBase->SizeOfBlock == 0)
++    {
++        //! here exists no rellocations
++        return;
++    }
++
++    QWORD allocationSize = 0;           //! how many allocations are there
++    PIMAGE_BASE_RELOCATION cRelocation = relocationBase;
++    while(allocationSize < RelocationImage->Size)
++    {
++        //! Pointer where to relloc in the MZ-PE (start of a section)
++        PVOID pToReloc = PtrOffset(BaseAddress, cRelocation->VirtualAddress);
++
++        //! As you can see in the stackoverflow link, the PREALOC is sharing the same space with the BASE_RELOCATION
++        //! TOTAL_SIZE = IMAGE_BASE_RELOCATION + NUMBEROFRELOCATIONS * IMAGE_RELOC
++        QWORD numberOfRellocations = cRelocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
++        numberOfRellocations /= sizeof(IMAGE_RELOCATION);
++
++        //! data after the structure
++        QWORD baseOfRelocationsStructs = (QWORD)cRelocation + sizeof(IMAGE_BASE_RELOCATION);
++
++        //! Change data for rellocation
++        for (int i = 0; i < numberOfRellocations; i++)
++        {
++            PIMAGE_RELOCATION currentRelloc = (PIMAGE_RELOCATION)(baseOfRelocationsStructs + sizeof(IMAGE_RELOCATION) * i);
++            WORD typeAlloc = currentRelloc->rData >> 12;
++            QWORD offset = currentRelloc->rData & 0x0FFF;
++
++            //! calculate the address of the rellocation
++            QWORD* addrRelocation = (QWORD*)((QWORD)pToReloc + offset);
++            //! type of the relocation
++            switch (typeAlloc)
++            {
++            case IMAGE_REL_BASED_ABSOLUTE:
++                break;
++            case IMAGE_REL_BASED_DIR64:
++                *addrRelocation += RellocationOffset;
++                break;
++            //! if you need all other options, you are my invite to add them here.
++            }
++        }
++
++        //! go to next structure
++        allocationSize += cRelocation->SizeOfBlock;
++        cRelocation = (PIMAGE_BASE_RELOCATION)((QWORD)cRelocation + cRelocation->SizeOfBlock);
++    }
++    //! update the address of the entrypoint
++    HeaderInfo->AddressOfEntryPoint = PtrOffset(HeaderInfo->AddressOfEntryPoint, RellocationOffset);
++    HeaderInfo->Preferred.AddressOfEntryPoint = PtrOffset(HeaderInfo->Preferred.AddressOfEntryPoint, RellocationOffset);
++    pNTHeader->OptionalHeader.AddressOfEntryPoint = pNTHeader->OptionalHeader.AddressOfEntryPoint + (DWORD)RellocationOffset;
++}
++
+ static
+ STATUS
+ _MmuMapPeInMemory(
+     IN          PPAGING_DATA            PagingData,
+     IN          PPE_NT_HEADER_INFO      HeaderInfo,
+-    IN          PVOID                   AddressToMap
++    //! if this address is NULL, it will loaded to preffered address base.
++    //! else checks if the relocation exists
++    IN          PVOID                   WantedAddress
++
+     )
+ {
+     STATUS status;
+@@ -1579,6 +1657,11 @@ _MmuMapPeInMemory(
+     ASSERT(NULL != HeaderInfo);
+     ASSERT(IsAddressAligned(HeaderInfo->ImageBase,PAGE_SIZE));
+ 
++    PVOID AddressToMap = WantedAddress;
++    if (WantedAddress == NULL)
++    {
++        AddressToMap = HeaderInfo->Preferred.ImageBase;
++    }
+     ASSERT(NULL != AddressToMap);
+     ASSERT(IsAddressAligned(AddressToMap,PAGE_SIZE));
+ 
+@@ -1763,10 +1846,12 @@ _MmuMapPeInMemory(
+         );
+     }
+ 
++    //! relocation time
++    _MmuApplyRelocations(HeaderInfo->ImageBase, AddressToMap, HeaderInfo);
++
+     LOG_TRACE_MMU("PE mapped succeesfully\n");
+ 
+     return status;
+-
+ }
+ 
+ static
+diff --git a/HAL9000/src/process.c b/HAL9000/src/process.c
+index 5a9fcd8..32e2c82 100644
+--- a/HAL9000/src/process.c
++++ b/HAL9000/src/process.c
+@@ -214,8 +214,9 @@ STATUS
+ ProcessCreate(
+     IN_Z        char*       PathToExe,
+     IN_OPT_Z    char*       Arguments,
+-    OUT_PTR     PPROCESS*   Process
+-    )
++    OUT_PTR     PPROCESS*   Process,
++    IN_OPT      PVOID       WantedAddress
++)
+ {
+     STATUS status;
+     PPROCESS pProcess;
+@@ -263,6 +264,9 @@ ProcessCreate(
+         }
+         LOG_TRACE_PROCESS("Successfully retrieved process NT header!\n");
+ 
++        // prepare data for the rellocation mechanism
++        pProcess->HeaderInfo->WantedAddress = WantedAddress;
++
+         status = MmuCreateAddressSpaceForProcess(pProcess);
+         if (!SUCCEEDED(status))
+         {
+diff --git a/HAL9000/src/syscall.c b/HAL9000/src/syscall.c
+index 12f9de8..bf1ed81 100644
+--- a/HAL9000/src/syscall.c
++++ b/HAL9000/src/syscall.c
+@@ -306,7 +306,7 @@ SyscallProcessCreate(
+     );
+ 
+     PPROCESS pProcess;
+-    status = ProcessCreate(FullProcessPath, Arguments, &pProcess);
++    status = ProcessCreate(FullProcessPath, Arguments, &pProcess, NULL);
+ 
+     if (SUCCEEDED(status)) {
+         *ProcessHandle = AddUmHandle(UmHandleTypeProcess, (QWORD)pProcess, &process->UmHandleManager);
+diff --git a/HAL9000/src/test_process.c b/HAL9000/src/test_process.c
+index 8211972..2d61737 100644
+--- a/HAL9000/src/test_process.c
++++ b/HAL9000/src/test_process.c
+@@ -165,7 +165,8 @@ TestProcessFunctionality(
+         {
+             status = ProcessCreate(fullPath,
+                                    ProcessTest->ProcessCommandLine,
+-                                   &pProcesses[i]);
++                                   &pProcesses[i],
++                                   NULL);
+             if (!SUCCEEDED(status))
+             {
+                 LOG_FUNC_ERROR("ProcessCreate", status);
+diff --git a/HAL9000/src/um_application.c b/HAL9000/src/um_application.c
+index 886eb13..0b034b7 100644
+--- a/HAL9000/src/um_application.c
++++ b/HAL9000/src/um_application.c
+@@ -132,7 +132,7 @@ UmApplicationRun(
+                                 ThreadPriorityDefault,
+                                 //  warning C4055: 'type cast': from data pointer 'PVOID' to function pointer 'PFUNC_ThreadStart'
+ #pragma warning(suppress:4055)
+-                                (PFUNC_ThreadStart)Process->HeaderInfo->Preferred.AddressOfEntryPoint,
++                                (PFUNC_ThreadStart)Process->HeaderInfo->Preferred.AddressOfEntryPoint,  //!  preff. address :-/ rly?
+                                 NULL,
+                                 &pThread,
+                                 Process);
+diff --git a/PE_Parser/headers/pe_structures.h b/PE_Parser/headers/pe_structures.h
+index 9936755..e3658f1 100644
+--- a/PE_Parser/headers/pe_structures.h
++++ b/PE_Parser/headers/pe_structures.h
+@@ -153,4 +153,19 @@ typedef struct _IMAGE_SECTION_HEADER {
+     WORD    NumberOfLinenumbers;
+     DWORD   Characteristics;
+ } IMAGE_SECTION_HEADER, *PIMAGE_SECTION_HEADER;
++
++//! for relocations (https://doxygen.reactos.org/d5/d44/ntimage_8h_source.html)
++typedef struct _IMAGE_BASE_RELOCATION
++{
++    DWORD VirtualAddress;
++    DWORD SizeOfBlock;
++} IMAGE_BASE_RELOCATION, *PIMAGE_BASE_RELOCATION;
++
++//! Sursa: https://docs.microsoft.com/en-us/windows/win32/debug/pe-format
++#define IMAGE_REL_BASED_ABSOLUTE    0       //! The base relocation is skipped. This type can be used to pad a block.
++#define IMAGE_REL_BASED_DIR64       10      //! The base relocation is skipped. This type can be used to pad a block.
++
++typedef struct _IMAGE_RELOCATION {
++    WORD rData;                 //! 4 bis = type + 12 bits = offset
++} IMAGE_RELOCATION, *PIMAGE_RELOCATION;
+ #pragma pack(pop)
+\ No newline at end of file
+diff --git a/PE_Parser/inc/pe_exports.h b/PE_Parser/inc/pe_exports.h
+index 36ea1b1..13376f1 100644
+--- a/PE_Parser/inc/pe_exports.h
++++ b/PE_Parser/inc/pe_exports.h
+@@ -13,11 +13,14 @@ typedef struct _PE_NT_HEADER_INFO
+     PVOID               NtBase;
+     PVOID               AddressOfEntryPoint;
+ 
++    // the address were the exe will be loaded
++    PVOID               WantedAddress;
++
+     DWORD               ImageAlignment;
+     DWORD               FileAlignment;
+ 
+     // Refers to the addresses where the PE should ideally be loaded
+-    struct 
++    struct
+     {
+         PVOID           ImageBase;
+         PVOID           AddressOfEntryPoint;
+@@ -95,6 +98,7 @@ typedef struct _PE_SECTION_INFO
+     DWORD               Characteristics;
+ } PE_SECTION_INFO, *PPE_SECTION_INFO;
+ 
++
+ #define IMAGE_DIRECTORY_ENTRY_EXPORT          0   // Export Directory
+ #define IMAGE_DIRECTORY_ENTRY_IMPORT          1   // Import Directory
+ #define IMAGE_DIRECTORY_ENTRY_RESOURCE        2   // Resource Directory
