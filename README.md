@@ -10,3 +10,5 @@ The implementation is 100% original, so if are using it in a sistem, be aware th
 
 To visualize my changes you can use: https://diffy.org/
 For any other related questions, or for sending me an appreciation (believe me, I have done a lot of research to find how the data should be parsed), send me a dm.
+
+The action is in **\_MmuApplyRelocations** method. ;-)
